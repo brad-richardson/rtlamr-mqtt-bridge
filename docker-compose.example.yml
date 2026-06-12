@@ -1,0 +1,27 @@
+# Example deployment. Copy into your stack and adjust.
+#
+# This intentionally mirrors a typical hertzg/rtl_433 service definition so
+# it can replace one in place: same MQTT topics, same Home Assistant configs.
+services:
+  rtlamr-bridge:
+    build: .   # or: image: ghcr.io/<you>/rtlamr-mqtt-bridge:latest
+    container_name: rtlamr-bridge
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb            # RTL-SDR dongle
+    network_mode: host          # or attach to your broker's network
+    environment:
+      TZ: America/Vancouver     # event timestamps are local time, like rtl_433
+      MQTT_HOST: localhost
+      MQTT_PORT: 1883
+      MQTT_USER: rtl433
+      MQTT_PASSWORD: ${MQTT_PASS}
+      MQTT_RETAIN: "true"
+      # rtl_433-compatible defaults; override if your topics differ:
+      # MQTT_BASE_TOPIC: rtl_433
+      # Water meters only (Neptune R900, both encodings, auto-resolved):
+      RTLAMR_MSGTYPE: r900,r900bcd
+      # Add Itron ERT electric/gas meters too (if symbol rates allow):
+      # RTLAMR_MSGTYPE: scm,scm+,r900,r900bcd
+      # Restrict to your own meter IDs (less MQTT noise):
+      # RTLAMR_FILTER_ID: "1485200001,1582600001"
