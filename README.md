@@ -132,6 +132,23 @@ Note rtlamr requires all enabled message types to share a symbol rate —
 | `R900_BCD_IDS` / `R900_BINARY_IDS` | — | per-meter overrides for `auto` |
 | `R900_PAIR_WINDOW` | `2.0` | seconds to wait for the paired decode |
 | `RESTART_DELAY` | `5.0` | backoff when rtlamr/rtl_tcp exit |
+| `WATCHDOG_TIMEOUT` | `300` | recycle rtl_tcp if no meter data for this many seconds (`0` disables) |
+| `WATCHDOG_INTERVAL` | `30` | how often the watchdog checks data age |
+| `RECYCLE_COOLDOWN` | `max(2×RESTART_DELAY, 10)` | min seconds between rtl_tcp recycles |
+| `HEARTBEAT_FILE` | `/tmp/rtlamr-bridge.heartbeat` | last-message timestamp file backing the Docker healthcheck |
+| `HEALTHCHECK_MAX_AGE` | `600` | healthcheck reports unhealthy when the heartbeat is older than this |
+
+### Surviving USB re-enumeration
+
+A USB SDR that re-enumerates (unplug/replug, power blip, hub reset) doesn't make
+`rtl_tcp` exit — it keeps serving an empty sample stream, so `rtlamr` connects but
+reads nothing and loops forever with no data. The bridge recovers automatically:
+when `rtlamr` exits, or when no meter message arrives for `WATCHDOG_TIMEOUT`, it
+recycles `rtl_tcp` so it re-opens the device. The image also ships a `HEALTHCHECK`
+(backed by `HEARTBEAT_FILE`) so Docker / autoheal can restart the container if the
+in-process recovery ever fails. Map the whole bus (`/dev/bus/usb:/dev/bus/usb`),
+not a fixed `/dev/bus/usb/00X/0YY` node, so the new device node is visible after
+re-enumeration.
 
 ## Home Assistant example
 

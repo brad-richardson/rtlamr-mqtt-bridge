@@ -73,6 +73,22 @@ R900_PAIR_WINDOW = float(env("R900_PAIR_WINDOW", "2.0"))
 
 RESTART_DELAY = float(env("RESTART_DELAY", "5.0"))
 
+# Robustness: rtl_tcp keeps running (and serving an empty sample stream) when
+# the USB dongle re-enumerates, so rtlamr connects but reads nothing and loops
+# forever. The supervisor below recovers by recycling rtl_tcp -- forcing it to
+# re-open the device -- whenever rtlamr exits or meter data goes stale.
+WATCHDOG_TIMEOUT = float(env("WATCHDOG_TIMEOUT", "300"))    # 0 disables
+WATCHDOG_INTERVAL = float(env("WATCHDOG_INTERVAL", "30"))
+# Don't recycle more than once per cooldown, so a watchdog recycle and the
+# rtlamr-exit it triggers don't kill each other's fresh rtl_tcp.
+RECYCLE_COOLDOWN = float(env("RECYCLE_COOLDOWN", str(max(RESTART_DELAY * 2, 10))))
+
+# Heartbeat file: holds the epoch time of the last meter message. The Docker
+# HEALTHCHECK (python bridge.py --healthcheck) marks the container unhealthy
+# when this goes stale, so external monitoring / autoheal can act too.
+HEARTBEAT_FILE = env("HEARTBEAT_FILE", "/tmp/rtlamr-bridge.heartbeat")
+HEALTHCHECK_MAX_AGE = float(env("HEALTHCHECK_MAX_AGE", "600"))
+
 
 # --------------------------------------------------------------------------
 # rtlamr -> rtl_433 message mapping
@@ -323,6 +339,11 @@ class Supervisor:
     def __init__(self):
         self.stopping = threading.Event()
         self.procs = []
+        self.lock = threading.Lock()
+        self.rtl_tcp_proc = None        # current rtl_tcp Popen, or None
+        self.rtl_tcp_recycling = False  # this exit was a requested recycle
+        self.last_recycle_mono = None   # monotonic time of last recycle
+        self.last_data_mono = time.monotonic()  # liveness clock for watchdog
 
     def stop(self, *_):
         self.stopping.set()
@@ -332,16 +353,77 @@ class Supervisor:
             except OSError:
                 pass
 
+    def mark_data(self):
+        """Record that meter data is flowing (resets watchdog + heartbeat)."""
+        now = time.monotonic()
+        with self.lock:
+            self.last_data_mono = now
+        if HEARTBEAT_FILE:
+            try:
+                with open(HEARTBEAT_FILE, "w") as f:
+                    f.write(str(time.time()))
+            except OSError as e:
+                log.warning("could not write heartbeat %s: %r", HEARTBEAT_FILE, e)
+
+    def data_age(self):
+        with self.lock:
+            return time.monotonic() - self.last_data_mono
+
+    def recycle_rtl_tcp(self, reason):
+        """Kill the current rtl_tcp so rtl_tcp_loop respawns it, forcing a fresh
+        open of the USB device (recovers from dongle re-enumeration). No-ops if
+        rtl_tcp was already recycled within RECYCLE_COOLDOWN, so a watchdog
+        recycle and the rtlamr exit it causes don't kill each other's restart."""
+        with self.lock:
+            now = time.monotonic()
+            if (self.last_recycle_mono is not None
+                    and now - self.last_recycle_mono < RECYCLE_COOLDOWN):
+                return
+            proc = self.rtl_tcp_proc
+            if proc is None:
+                return
+            self.last_recycle_mono = now
+            self.rtl_tcp_recycling = True
+        log.warning("recycling rtl_tcp (%s)", reason)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    def watchdog_loop(self):
+        """Recycle rtl_tcp if no meter data has arrived for WATCHDOG_TIMEOUT."""
+        if WATCHDOG_TIMEOUT <= 0:
+            return
+        while not self.stopping.is_set():
+            self.stopping.wait(WATCHDOG_INTERVAL)
+            if self.stopping.is_set():
+                return
+            age = self.data_age()
+            if age >= WATCHDOG_TIMEOUT:
+                self.mark_data()  # reset clock so we don't re-fire immediately
+                self.recycle_rtl_tcp("watchdog: no data for %.0fs" % age)
+
     def rtl_tcp_loop(self):
         cmd = [RTL_TCP_BIN] + shlex.split(RTL_TCP_ARGS)
         while not self.stopping.is_set():
             log.info("starting: %s", " ".join(cmd))
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.STDOUT)
+            with self.lock:
+                self.rtl_tcp_proc = proc
             self.procs.append(proc)
             proc.wait()
             self.procs.remove(proc)
-            if not self.stopping.is_set():
+            with self.lock:
+                self.rtl_tcp_proc = None
+                requested = self.rtl_tcp_recycling
+                self.rtl_tcp_recycling = False
+            if self.stopping.is_set():
+                return
+            self.mark_data()  # grace period for the fresh rtl_tcp + rtlamr
+            if requested:
+                log.info("rtl_tcp recycled; restarting now")
+            else:
                 log.warning("rtl_tcp exited (%s); restarting in %.0fs",
                             proc.returncode, RESTART_DELAY)
                 self.stopping.wait(RESTART_DELAY)
@@ -360,6 +442,7 @@ class Supervisor:
         cmd = self.rtlamr_cmd()
         while not self.stopping.is_set():
             log.info("starting: %s", " ".join(cmd))
+            self.mark_data()  # grace period so the watchdog waits out startup
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=sys.stderr, text=True)
             self.procs.append(proc)
@@ -372,6 +455,7 @@ class Supervisor:
                 except ValueError:
                     log.warning("unparseable rtlamr line: %.200s", line)
                     continue
+                self.mark_data()  # a decoded record == rtl_tcp is alive
                 msg_type = record.get("Type")
                 msg = record.get("Message") or {}
                 event_time = rtl433_time(record.get("Time"))
@@ -386,6 +470,10 @@ class Supervisor:
             if not self.stopping.is_set():
                 log.warning("rtlamr exited (%s); restarting in %.0fs",
                             proc.returncode, RESTART_DELAY)
+                # rtlamr exiting almost always means rtl_tcp went dead (i/o
+                # timeout from a re-enumerated dongle); recycle it so the
+                # restarted rtlamr reconnects to a freshly opened device.
+                self.recycle_rtl_tcp("rtlamr exited")
                 self.stopping.wait(RESTART_DELAY)
 
 
@@ -418,6 +506,8 @@ def main():
     if RTL_TCP_SPAWN:
         threading.Thread(target=supervisor.rtl_tcp_loop, daemon=True).start()
         time.sleep(2)  # let rtl_tcp claim the dongle before rtlamr connects
+        # watchdog recycles rtl_tcp on stale data; only meaningful when we own it
+        threading.Thread(target=supervisor.watchdog_loop, daemon=True).start()
 
     def flush_loop():
         while not supervisor.stopping.is_set():
@@ -434,5 +524,18 @@ def main():
         client.loop_stop()
 
 
+def healthcheck():
+    """Exit 0 if a meter message was published within HEALTHCHECK_MAX_AGE
+    seconds, else exit 1. Backs the Docker HEALTHCHECK."""
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        sys.exit(1)
+    sys.exit(0 if time.time() - last < HEALTHCHECK_MAX_AGE else 1)
+
+
 if __name__ == "__main__":
+    if "--healthcheck" in sys.argv:
+        healthcheck()
     main()

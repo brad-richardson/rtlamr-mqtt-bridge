@@ -21,4 +21,9 @@ RUN pip install --no-cache-dir "paho-mqtt>=2,<3"
 
 COPY bridge.py /app/bridge.py
 
+# Unhealthy when no meter message has been published recently (HEALTHCHECK_MAX_AGE,
+# default 600s) -- e.g. a re-enumerated dongle the in-process watchdog couldn't recover.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD ["python", "/app/bridge.py", "--healthcheck"]
+
 ENTRYPOINT ["python", "-u", "/app/bridge.py"]

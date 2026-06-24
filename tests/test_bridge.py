@@ -130,3 +130,52 @@ def test_event_json_is_rtl433_shaped():
     parsed = json.loads(json.dumps(data))
     assert list(parsed)[0] == "time"
     assert parsed["model"] == "Neptune-R900"
+
+
+# --- supervisor recovery (rtl_tcp recycling on USB re-enumeration) ----------
+
+class _FakeProc:
+    def __init__(self):
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
+
+
+def test_recycle_terminates_proc_and_flags_requested():
+    sup = bridge.Supervisor()
+    proc = _FakeProc()
+    sup.rtl_tcp_proc = proc
+    sup.recycle_rtl_tcp("test")
+    assert proc.terminated
+    assert sup.rtl_tcp_recycling is True
+
+
+def test_recycle_respects_cooldown():
+    sup = bridge.Supervisor()
+    first = _FakeProc()
+    sup.rtl_tcp_proc = first
+    sup.recycle_rtl_tcp("first")
+    assert first.terminated
+    # a second recycle within the cooldown must not kill the fresh rtl_tcp
+    second = _FakeProc()
+    sup.rtl_tcp_proc = second
+    sup.rtl_tcp_recycling = False
+    sup.recycle_rtl_tcp("too soon")
+    assert second.terminated is False
+    assert sup.rtl_tcp_recycling is False
+
+
+def test_recycle_without_proc_is_noop():
+    sup = bridge.Supervisor()
+    sup.rtl_tcp_proc = None
+    sup.recycle_rtl_tcp("nothing running")  # must not raise
+
+
+def test_mark_data_resets_age_and_writes_heartbeat(tmp_path, monkeypatch):
+    heartbeat = tmp_path / "hb"
+    monkeypatch.setattr(bridge, "HEARTBEAT_FILE", str(heartbeat))
+    sup = bridge.Supervisor()
+    sup.mark_data()
+    assert heartbeat.exists()
+    assert sup.data_age() < 1.0
