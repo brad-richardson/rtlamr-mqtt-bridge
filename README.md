@@ -125,6 +125,8 @@ Note rtlamr requires all enabled message types to share a symbol rate —
 | `RTLAMR_FILTER_ID` | — | comma-separated meter IDs to pass through |
 | `RTLAMR_CENTERFREQ` | rtlamr default (912.6 MHz) | tune the 2.4 MHz window |
 | `RTLAMR_SERVER` | `127.0.0.1:1234` | rtl_tcp address |
+| `RTLAMR_SYMBOLLENGTH` | `32` | sample rate: CPU vs. sensitivity — see below |
+| `RTLAMR_DROP_SUMMARY_INTERVAL` | `300` | seconds between "fell behind" summaries |
 | `RTLAMR_ARGS` | — | extra raw rtlamr flags |
 | `RTL_TCP_SPAWN` | `true` | run rtl_tcp inside the container |
 | `RTL_TCP_ARGS` | — | extra rtl_tcp flags (e.g. `-d 1 -g 40`) |
@@ -137,6 +139,44 @@ Note rtlamr requires all enabled message types to share a symbol rate —
 | `RECYCLE_COOLDOWN` | `max(2×RESTART_DELAY, 10)` | min seconds between rtl_tcp recycles |
 | `HEARTBEAT_FILE` | `/tmp/rtlamr-bridge.heartbeat` | last-message timestamp file backing the Docker healthcheck |
 | `HEALTHCHECK_MAX_AGE` | `600` | healthcheck reports unhealthy when the heartbeat is older than this |
+
+### CPU usage and `RTLAMR_SYMBOLLENGTH`
+
+`rtlamr`'s sample rate is `32768 × symbollength`, and decoder cost scales with it.
+rtlamr's own default of 72 means 2.36 MS/s, which a lot of hosts can't demodulate
+in real time. When that happens rtlamr doesn't slow down or back off — it pegs a
+core and logs `not keeping up with rtl_tcp` for every block it drops, which is
+thousands of lines a minute. Left alone in Docker's default `json-file` driver
+with no rotation, that grows without bound (one deployment reached 499 MB in nine
+days).
+
+So this bridge defaults to `RTLAMR_SYMBOLLENGTH=32` (1.05 MS/s). Measured on the
+same receiver and meters:
+
+| symbollength | sample rate | CPU (one core) | dropped blocks |
+|---|---|---|---|
+| 72 (rtlamr default) | 2.36 MS/s | ~45% | continuous |
+| 32 (this default) | 1.05 MS/s | ~31% | none |
+
+Lower means less sensitivity, so a marginal meter can drop out. If a meter you
+used to hear goes quiet, raise it (`48`, then `72`) rather than fighting gain;
+if you only care about a strong nearby meter and want the CPU back, try `8`.
+Setting `-symbollength=` yourself in `RTLAMR_ARGS` overrides this, and setting
+`RTLAMR_SYMBOLLENGTH=` (empty) leaves rtlamr's own default alone.
+
+Two things worth pairing with it: `RTLAMR_FILTER_ID`, so you publish your own
+meters instead of every meter in the neighborhood (with `MQTT_RETAIN=true` those
+strangers otherwise pile up permanently in the broker), and log rotation, because
+no in-process throttle can protect you from an unbounded container log:
+
+```yaml
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+```
+
+Note that trimming `RTLAMR_MSGTYPE` is *not* an effective CPU fix — dropping one
+of four message types measured as no improvement. The sample rate is the lever.
 
 ### Surviving USB re-enumeration
 

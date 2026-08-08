@@ -23,5 +23,16 @@ services:
       RTLAMR_MSGTYPE: r900,r900bcd
       # Add Itron ERT electric/gas meters too (if symbol rates allow):
       # RTLAMR_MSGTYPE: scm,scm+,r900,r900bcd
-      # Restrict to your own meter IDs (less MQTT noise):
+      # Restrict to your own meter IDs. Strongly recommended with MQTT_RETAIN:
+      # otherwise every meter in range is retained in your broker forever.
       # RTLAMR_FILTER_ID: "1485200001,1582600001"
+      # Sample rate vs. sensitivity. Default 32 keeps up on modest hardware;
+      # raise to 48/72 if a distant meter goes quiet. See README.
+      # RTLAMR_SYMBOLLENGTH: "32"
+    # rtlamr can emit thousands of drop errors a minute if it falls behind, and
+    # Docker's json-file driver does not rotate by default. Always cap it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

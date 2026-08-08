@@ -60,6 +60,17 @@ RTLAMR_SERVER = env("RTLAMR_SERVER", "127.0.0.1:1234")
 RTLAMR_CENTERFREQ = env("RTLAMR_CENTERFREQ")
 RTLAMR_FILTER_ID = env("RTLAMR_FILTER_ID")
 RTLAMR_ARGS = env("RTLAMR_ARGS", "")
+# Symbol length sets rtlamr's sample rate (rate = 32768 * symbollength), and the
+# decoder cost scales with it. rtlamr's own default of 72 means 2.36 MS/s, which
+# many hosts cannot demodulate in real time: rtlamr then pegs a core and floods
+# stderr with "not keeping up with rtl_tcp" (measured: ~45% of a core, endless
+# drop errors). 32 -> 1.05 MS/s decodes the same meters at ~31% with no drops.
+# Raise it (48/72) if a distant meter stops being heard; lower it (8) to trade
+# more sensitivity for less CPU.
+RTLAMR_SYMBOLLENGTH = env("RTLAMR_SYMBOLLENGTH", "32")
+# rtlamr logs one drop line per lagging block, which can reach millions of lines
+# a day and fill the container log. Collapse repeats into one summary per window.
+RTLAMR_DROP_SUMMARY_INTERVAL = float(env("RTLAMR_DROP_SUMMARY_INTERVAL", "300"))
 
 RTL_TCP_SPAWN = env_bool("RTL_TCP_SPAWN", True)
 RTL_TCP_BIN = env("RTL_TCP_BIN", "rtl_tcp")
@@ -435,8 +446,48 @@ class Supervisor:
             cmd.append("-centerfreq=" + RTLAMR_CENTERFREQ)
         if RTLAMR_FILTER_ID:
             cmd.append("-filterid=" + RTLAMR_FILTER_ID)
-        cmd += shlex.split(RTLAMR_ARGS)
+        extra = shlex.split(RTLAMR_ARGS)
+        # An explicit -symbollength in RTLAMR_ARGS wins over the env default.
+        if RTLAMR_SYMBOLLENGTH and not any(
+                a == "-symbollength" or a.startswith("-symbollength=")
+                for a in extra):
+            cmd.append("-symbollength=" + RTLAMR_SYMBOLLENGTH)
+        cmd += extra
         return cmd
+
+    def drain_stderr(self, stream):
+        """Forward rtlamr's stderr, collapsing "not keeping up with rtl_tcp"
+        floods into one summary per RTLAMR_DROP_SUMMARY_INTERVAL. rtlamr emits
+        that line for every block it fails to demodulate in time, which on a
+        loaded host is thousands per minute -- enough to fill a disk with
+        container logs. The condition still gets reported, just not per-block."""
+        dropped = 0
+        window_start = time.monotonic()
+
+        def flush():
+            nonlocal dropped, window_start
+            if dropped:
+                elapsed = time.monotonic() - window_start
+                log.warning("rtlamr fell behind rtl_tcp: %d dropped block(s) in "
+                            "%.0fs -- lower RTLAMR_SYMBOLLENGTH (currently %s) "
+                            "or reduce RTLAMR_MSGTYPE",
+                            dropped, elapsed, RTLAMR_SYMBOLLENGTH or "rtlamr default")
+            dropped = 0
+            window_start = time.monotonic()
+
+        try:
+            for line in stream:
+                if "not keeping up with rtl_tcp" in line:
+                    dropped += 1
+                    if time.monotonic() - window_start >= RTLAMR_DROP_SUMMARY_INTERVAL:
+                        flush()
+                    continue
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        except (OSError, ValueError):
+            pass  # stream closed as the process went away
+        finally:
+            flush()
 
     def rtlamr_loop(self, client, resolver):
         cmd = self.rtlamr_cmd()
@@ -444,8 +495,11 @@ class Supervisor:
             log.info("starting: %s", " ".join(cmd))
             self.mark_data()  # grace period so the watchdog waits out startup
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=sys.stderr, text=True)
+                                    stderr=subprocess.PIPE, text=True)
             self.procs.append(proc)
+            draining = threading.Thread(target=self.drain_stderr,
+                                        args=(proc.stderr,), daemon=True)
+            draining.start()
             for line in proc.stdout:
                 line = line.strip()
                 if not line.startswith("{"):
@@ -466,6 +520,7 @@ class Supervisor:
                 for event, ts in events:
                     publish(client, event, ts)
             proc.wait()
+            draining.join(timeout=5)  # let the last drop summary land
             self.procs.remove(proc)
             if not self.stopping.is_set():
                 log.warning("rtlamr exited (%s); restarting in %.0fs",

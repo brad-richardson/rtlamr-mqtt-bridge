@@ -179,3 +179,49 @@ def test_mark_data_resets_age_and_writes_heartbeat(tmp_path, monkeypatch):
     sup.mark_data()
     assert heartbeat.exists()
     assert sup.data_age() < 1.0
+
+
+# rtlamr's default symbol length (72 -> 2.36 MS/s) outruns the decoder on many
+# hosts, which shows up as a pegged core plus a flood of drop errors.
+
+def test_symbollength_default_is_applied(monkeypatch):
+    monkeypatch.setattr(bridge, "RTLAMR_SYMBOLLENGTH", "32")
+    monkeypatch.setattr(bridge, "RTLAMR_ARGS", "")
+    assert "-symbollength=32" in bridge.Supervisor().rtlamr_cmd()
+
+
+def test_explicit_symbollength_arg_wins(monkeypatch):
+    monkeypatch.setattr(bridge, "RTLAMR_SYMBOLLENGTH", "32")
+    monkeypatch.setattr(bridge, "RTLAMR_ARGS", "-symbollength=72")
+    cmd = bridge.Supervisor().rtlamr_cmd()
+    assert "-symbollength=72" in cmd
+    assert "-symbollength=32" not in cmd
+
+
+def test_empty_symbollength_leaves_rtlamr_default(monkeypatch):
+    monkeypatch.setattr(bridge, "RTLAMR_SYMBOLLENGTH", "")
+    monkeypatch.setattr(bridge, "RTLAMR_ARGS", "")
+    assert not any(a.startswith("-symbollength")
+                   for a in bridge.Supervisor().rtlamr_cmd())
+
+
+def test_drain_stderr_collapses_drop_flood(monkeypatch, capsys, caplog):
+    # One summary for the whole flood, not one line per dropped block.
+    monkeypatch.setattr(bridge, "RTLAMR_DROP_SUMMARY_INTERVAL", 3600.0)
+    lines = ['level=ERROR msg="not keeping up with rtl_tcp" rate=2351104\n'] * 5000
+    with caplog.at_level("WARNING"):
+        bridge.Supervisor().drain_stderr(iter(lines))
+    assert capsys.readouterr().err == ""
+    summaries = [r for r in caplog.records if "fell behind" in r.getMessage()]
+    assert len(summaries) == 1
+    assert "5000 dropped block(s)" in summaries[0].getMessage()
+
+
+def test_drain_stderr_forwards_other_lines(monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "RTLAMR_DROP_SUMMARY_INTERVAL", 3600.0)
+    lines = ['level=ERROR msg="not keeping up with rtl_tcp"\n',
+             'level=INFO msg="something worth reading"\n']
+    bridge.Supervisor().drain_stderr(iter(lines))
+    err = capsys.readouterr().err
+    assert "something worth reading" in err
+    assert "not keeping up" not in err
